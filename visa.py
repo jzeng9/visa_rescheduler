@@ -20,14 +20,15 @@ from sendgrid.helpers.mail import Mail
 
 
 config = configparser.ConfigParser()
-config.read('config.ini')
+config.read('config_visa.ini')
 
 USERNAME = config['USVISA']['USERNAME']
 PASSWORD = config['USVISA']['PASSWORD']
 SCHEDULE_ID = config['USVISA']['SCHEDULE_ID']
 MY_SCHEDULE_DATE = config['USVISA']['MY_SCHEDULE_DATE']
+MY_SCHEDULE_FAC = config['USVISA']['MY_SCHEDULE_FAC']
 COUNTRY_CODE = config['USVISA']['COUNTRY_CODE'] 
-FACILITY_ID = config['USVISA']['FACILITY_ID']
+# FACILITY_ID = config['USVISA']['FACILITY_ID']
 
 SENDGRID_API_KEY = config['SENDGRID']['SENDGRID_API_KEY']
 PUSH_TOKEN = config['PUSHOVER']['PUSH_TOKEN']
@@ -36,19 +37,20 @@ PUSH_USER = config['PUSHOVER']['PUSH_USER']
 LOCAL_USE = config['CHROMEDRIVER'].getboolean('LOCAL_USE')
 HUB_ADDRESS = config['CHROMEDRIVER']['HUB_ADDRESS']
 
-REGEX_CONTINUE = "//a[contains(text(),'Continuar')]"
-
+REGEX_CONTINUE = "//a[contains(text(),'Continue')]"
+is_greedy = True
 
 # def MY_CONDITION(month, day): return int(month) == 11 and int(day) >= 5
-def MY_CONDITION(month, day): return True # No custom condition wanted for the new scheduled date
+def MY_CONDITION(month, day):
+    return (int(month) == 10) or (int(month) == 11 and int(day) <= 5)
 
 STEP_TIME = 0.5  # time between steps (interactions with forms): 0.5 seconds
-RETRY_TIME = 60*10  # wait time between retries/checks for available dates: 10 minutes
+RETRY_TIME = 60*10*0.5  # wait time between retries/checks for available dates: 10 minutes
 EXCEPTION_TIME = 60*30  # wait time when an exception occurs: 30 minutes
 COOLDOWN_TIME = 60*60  # wait time when temporary banned (empty list): 60 minutes
 
-DATE_URL = f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment/days/{FACILITY_ID}.json?appointments[expedite]=false"
-TIME_URL = f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment/times/{FACILITY_ID}.json?date=%s&appointments[expedite]=false"
+# DATE_URL = "https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment/days/{}.json?appointments[expedite]=false"
+# TIME_URL = f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment/times/{FACILITY_ID}.json?date=%s&appointments[expedite]=false"
 APPOINTMENT_URL = f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment"
 EXIT = False
 
@@ -139,19 +141,19 @@ def do_login_action():
     print("\tlogin successful!")
 
 
-def get_date():
-    driver.get(DATE_URL)
+def get_date(city):
+    driver.get(f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment/days/{city}.json?appointments[expedite]=false")
     if not is_logged_in():
         login()
-        return get_date()
+        return get_date(city)
     else:
         content = driver.find_element(By.TAG_NAME, 'pre').text
         date = json.loads(content)
         return date
 
 
-def get_time(date):
-    time_url = TIME_URL % date
+def get_time(cur_city, date):
+    time_url = f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment/times/{cur_city}.json?date=%s&appointments[expedite]=false" % date
     driver.get(time_url)
     content = driver.find_element(By.TAG_NAME, 'pre').text
     data = json.loads(content)
@@ -160,19 +162,20 @@ def get_time(date):
     return time
 
 
-def reschedule(date):
-    global EXIT
+def reschedule(city, date):
+    global EXIT, MY_SCHEDULE_DATE, MY_SCHEDULE_FAC
     print(f"Starting Reschedule ({date})")
 
-    time = get_time(date)
+    time = get_time(city, date)
     driver.get(APPOINTMENT_URL)
+    driver.find_element(by=By.XPATH, value='//*[@id="main"]/div[3]/form/div[2]/div/input').click()
 
     data = {
         "utf8": driver.find_element(by=By.NAME, value='utf8').get_attribute('value'),
         "authenticity_token": driver.find_element(by=By.NAME, value='authenticity_token').get_attribute('value'),
         "confirmed_limit_message": driver.find_element(by=By.NAME, value='confirmed_limit_message').get_attribute('value'),
         "use_consulate_appointment_capacity": driver.find_element(by=By.NAME, value='use_consulate_appointment_capacity').get_attribute('value'),
-        "appointments[consulate_appointment][facility_id]": FACILITY_ID,
+        "appointments[consulate_appointment][facility_id]": city,
         "appointments[consulate_appointment][date]": date,
         "appointments[consulate_appointment][time]": time,
     }
@@ -184,11 +187,14 @@ def reschedule(date):
     }
 
     r = requests.post(APPOINTMENT_URL, headers=headers, data=data)
-    if(r.text.find('Successfully Scheduled') != -1):
+    if(r.text.find('successfully scheduled') != -1):
         msg = f"Rescheduled Successfully! {date} {time}"
         send_notification(msg)
-        EXIT = True
+        # EXIT = True
+        MY_SCHEDULE_DATE = date
+        MY_SCHEDULE_FAC = city
     else:
+        print(r.text)
         msg = f"Reschedule Failed. {date} {time}"
         send_notification(msg)
 
@@ -209,26 +215,35 @@ def print_dates(dates):
 
 last_seen = None
 
+def is_west(city): return city in [89, 95]
 
-def get_available_date(dates):
+def get_available_date(cur_city, dates):
     global last_seen
 
-    def is_earlier(date):
+    def is_earlier(cur_city, date):
         my_date = datetime.strptime(MY_SCHEDULE_DATE, "%Y-%m-%d")
         new_date = datetime.strptime(date, "%Y-%m-%d")
         result = my_date > new_date
-        print(f'Is {my_date} > {new_date}:\t{result}')
-        return result
+
+        if is_west(cur_city) and (not is_west(COUNTRY_CODE)):
+            return True
+        elif (is_west(cur_city) == is_west(COUNTRY_CODE)) and result:
+            return True
+        return False
 
     print("Checking for an earlier date:")
     for d in dates:
         date = d.get('date')
-        if is_earlier(date) and date != last_seen:
+        if is_earlier(cur_city, date) and date != last_seen:
             _, month, day = date.split('-')
             if(MY_CONDITION(month, day)):
                 last_seen = date
                 return date
 
+def get_a_new_city(cur_city):
+    if cur_city == 89:
+        return 95
+    return 89
 
 def push_notification(dates):
     msg = "date: "
@@ -240,6 +255,7 @@ def push_notification(dates):
 if __name__ == "__main__":
     login()
     retry_count = 0
+    cur_city = 89
     while 1:
         if retry_count > 6:
             break
@@ -247,19 +263,23 @@ if __name__ == "__main__":
             print("------------------")
             print(datetime.today())
             print(f"Retry count: {retry_count}")
+            print("The scdule city is {}, the date is ", MY_SCHEDULE_FAC, MY_SCHEDULE_DATE) 
             print()
 
-            dates = get_date()[:5]
-            if not dates:
-              msg = "List is empty"
-              send_notification(msg)
-              EXIT = True
+            cur_city = get_a_new_city(cur_city)
+            print("The city is {}", cur_city)
+
+            dates = get_date(cur_city)[:5]
+            # if not dates:
+            #   msg = "List is empty"
+            #   send_notification(msg)
+            #   EXIT = True
             print_dates(dates)
-            date = get_available_date(dates)
-            print()
-            print(f"New date: {date}")
+            date = get_available_date(cur_city, dates)
             if date:
-                reschedule(date)
+                print()
+                print(f"New date: {date} in {cur_city}")
+                reschedule(cur_city, date)
                 push_notification(dates)
 
             if(EXIT):
@@ -268,9 +288,10 @@ if __name__ == "__main__":
 
             if not dates:
               msg = "List is empty"
-              send_notification(msg)
-              #EXIT = True
-              time.sleep(COOLDOWN_TIME)
+              print(msg)
+              # send_notification(msg)
+              # EXIT = True
+              time.sleep(RETRY_TIME)
             else:
               time.sleep(RETRY_TIME)
 
